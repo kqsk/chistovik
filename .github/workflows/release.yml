@@ -1,0 +1,83 @@
+name: Release
+
+# Push a tag like v0.1.0 (or run it by hand with a version) -> installer, .sig and latest.json
+# in GitHub Releases (APP-05/07). A manual run creates the tag on the current commit.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without v, e.g. 0.1.0 (must match the files)"
+        required: true
+        type: string
+
+env:
+  TAG: ${{ github.event_name == 'workflow_dispatch' && format('v{0}', inputs.version) || github.ref_name }}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the app version
+        shell: pwsh
+        run: |
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $pkg = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          $tag = "$env:TAG".TrimStart("v")
+          if ($conf.version -ne $tag -or $cargo -ne $tag -or $pkg -ne $tag) {
+            Write-Error "Tag $tag != versions (tauri.conf $($conf.version), Cargo.toml $cargo, package.json $pkg)"
+            exit 1
+          }
+      - name: Signing key is configured
+        shell: pwsh
+        env:
+          KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if (-not $env:KEY) { Write-Error "Secret TAURI_SIGNING_PRIVATE_KEY is missing (run scripts/setup-signing.bat)"; exit 1 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      - run: npm test
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ env.TAG }}
+          releaseName: Чистовик ${{ env.TAG }}
+          releaseCommitish: ${{ github.sha }}
+          releaseBody: |
+            **Ранняя версия.** Установка без прав администратора: скачайте `*-setup.exe` и запустите.
+            Если Windows покажет «Windows защитила ваш компьютер» — нажмите «Подробнее» → «Выполнить в любом случае».
+
+            **Early version.** Per-user install, no admin rights: download `*-setup.exe` and run it.
+            If Windows SmartScreen appears, click “More info” → “Run anyway”.
+          releaseDraft: false
+          prerelease: false
+          # ASCII file names: GitHub strips Cyrillic from asset names ("_0.1.0_x64-setup.exe"),
+          # and then the action cannot match the signature and skips latest.json.
+          # Input names are those of tauri-action@v0 (newer docs call them differently).
+          assetNamePattern: Chistovik_[version]_[arch][setup][ext]
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+          # GitHub sometimes answers 503 while the NSIS toolchain is downloaded.
+          retryAttempts: 2
